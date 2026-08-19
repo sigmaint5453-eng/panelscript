@@ -1,4 +1,4 @@
-timedatectl set-timezone Asia/Manila
+timedatectl set-timezone Asia/riyadh
 
 install_require () {
     clear
