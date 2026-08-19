@@ -1,6 +1,6 @@
 
 #---------------[ Timezone ]-------------------------
-timedatectl set-timezone Asia/Manila
+timedatectl set-timezone Asia/riyadh
 
 #====================================================
 #   Install Sudo & User
