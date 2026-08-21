@@ -1,49 +1,23 @@
 #!/bin/bash
 
 # ============================================================
-# Debian OpenVPN + WS + Hysteria Installer
+# Debian OpenVPN + WS + Hysteria + Squid + Stunnel Installer
 # ============================================================
 
-set -u
+set -o pipefail
 
 export DEBIAN_FRONTEND=noninteractive
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-# ============================================================
-# DATABASE CONFIGURATION
-# ============================================================
-
-DB_HOST="localhost"
-DB_USER="premfayw_sigmaadmin"
-DB_PASS="Sksamiul@775"
-DB_NAME="premfayw_sigma_panel"
-
-# ============================================================
-# SERVER PORTS
-# ============================================================
-
-PORT_TCP="1194"
-PORT_UDP="1195"
-PORT_SSL="443"
-
-HYSTERIA_PORT="5666"
-SOCKS_PORT="80"
-SQUID_PORT="8080"
-
-OBFS="mediatekvpn"
 
 LOG_FILE="/var/log/debian_ovpnws_install.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+timedatectl set-timezone Asia/Riyadh 2>/dev/null || true
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-mkdir -p "$(dirname "$LOG_FILE")"
-
-exec > >(tee -a "$LOG_FILE") 2>&1
-
 log() {
-    echo
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
@@ -57,53 +31,109 @@ fail_install() {
 }
 
 # ============================================================
+# PRIVATE CONFIGURATION
+# These values are requested at install time.
+# Do NOT put real passwords/API keys in GitHub.
+# ============================================================
+
+echo
+echo "=========================================="
+echo "       SERVER CONFIGURATION"
+echo "=========================================="
+echo
+
+read -rp "Database Host [127.0.0.1]: " HOST
+HOST="${HOST:-127.0.0.1}"
+
+while [ -z "$USER" ]; do
+    read -rp "Database User: " USER
+done
+
+read -rsp "Database Password: " PASS
+echo
+
+while [ -z "$DBNAME" ]; do
+    read -rp "Database Name: " DBNAME
+done
+
+echo
+read -rp "API Link [https://premiumint.xyz/api/authentication]: " API_LINK
+API_LINK="${API_LINK:-https://premiumint.xyz/api/authentication}"
+
+read -rsp "API Key: " API_KEY
+echo
+
+read -rsp "adminmtk SSH Password: " ADMIN_PASSWORD
+echo
+
+if [ -z "$PASS" ]; then
+    fail_install "Database password cannot be empty."
+fi
+
+if [ -z "$API_KEY" ]; then
+    fail_install "API key cannot be empty."
+fi
+
+if [ -z "$ADMIN_PASSWORD" ]; then
+    fail_install "adminmtk password cannot be empty."
+fi
+
+# ============================================================
+# SERVER SETTINGS
+# ============================================================
+
+PORT_TCP=443
+PORT_UDP=1194
+PORT_SSL=8443
+OBFS="mediatekvpn"
+
+# ============================================================
 # SERVER INFORMATION
 # ============================================================
 
-timedatectl set-timezone Asia/Riyadh 2>/dev/null || true
+server_ip=""
 
-server_ip="$(curl -4 -s --max-time 10 https://api.ipify.org || true)"
+server_interface=""
 
-if [ -z "$server_ip" ]; then
-    fail_install "Could not determine public IP."
-fi
+# ============================================================
+# DETECT SERVER
+# ============================================================
 
-server_interface="$(
-    ip route get 8.8.8.8 2>/dev/null |
-    awk '/dev/ {
-        for (i=1;i<=NF;i++)
-            if ($i=="dev") {
-                print $(i+1)
-                exit
+detect_server() {
+
+    log "Detecting server information..."
+
+    server_ip=$(
+        curl -4 -s --max-time 10 https://api.ipify.org
+    )
+
+    if [ -z "$server_ip" ]; then
+        fail_install "Could not determine public IP."
+    fi
+
+    server_interface=$(
+        ip route get 8.8.8.8 2>/dev/null |
+        awk '
+        /dev/ {
+            for(i=1;i<=NF;i++) {
+                if($i=="dev") {
+                    print $(i+1)
+                    exit
+                }
             }
-    }'
-)"
+        }'
+    )
 
-[ -z "$server_interface" ] && server_interface="eth0"
+    if [ -z "$server_interface" ]; then
+        server_interface="eth0"
+    fi
 
-log "=========================================="
-log "Debian OpenVPN/WS installer"
-log "Server IP       : $server_ip"
-log "Interface       : $server_interface"
-log "DB Host         : $DB_HOST"
-log "DB User         : $DB_USER"
-log "DB Name         : $DB_NAME"
-log "TCP Port        : $PORT_TCP"
-log "UDP Port        : $PORT_UDP"
-log "SSL Port        : $PORT_SSL"
-log "Hysteria Port   : $HYSTERIA_PORT"
-log "=========================================="
+    log "Server IP : $server_ip"
+    log "Interface : $server_interface"
+}
 
 # ============================================================
-# ROOT CHECK
-# ============================================================
-
-if [ "$(id -u)" -ne 0 ]; then
-    fail_install "Run this installer as root."
-fi
-
-# ============================================================
-# ADMIN USER / SSH
+# SUDO / SSH USER
 # ============================================================
 
 install_sudo() {
@@ -111,29 +141,34 @@ install_sudo() {
     log "Configuring admin user..."
 
     if ! id adminmtk >/dev/null 2>&1; then
-        useradd -m adminmtk || true
+        useradd -m adminmtk ||
+            fail_install "Unable to create adminmtk."
     fi
 
-    echo 'adminmtk:Mediatek272124@@' | chpasswd \
-        || fail_install "Unable to configure adminmtk."
+    echo "adminmtk:$ADMIN_PASSWORD" |
+        chpasswd ||
+        fail_install "Unable to set adminmtk password."
 
-    usermod -aG sudo adminmtk || true
+    usermod -aG sudo adminmtk ||
+        fail_install "Unable to add adminmtk to sudo group."
 
-    if [ -f /etc/ssh/sshd_config ]; then
-
+    if grep -q '^PermitRootLogin yes' /etc/ssh/sshd_config; then
         sed -i \
-            's/^PermitRootLogin yes/PermitRootLogin no/g' \
+            's/^PermitRootLogin yes/PermitRootLogin no/' \
             /etc/ssh/sshd_config
-
-        if ! grep -q '^AllowGroups adminmtk' /etc/ssh/sshd_config; then
-            echo "AllowGroups adminmtk" >> /etc/ssh/sshd_config
-        fi
-
     fi
 
-    systemctl restart ssh 2>/dev/null ||
-    systemctl restart sshd 2>/dev/null ||
-    true
+    if ! grep -q '^AllowGroups adminmtk' /etc/ssh/sshd_config; then
+        echo "AllowGroups adminmtk" >> /etc/ssh/sshd_config
+    fi
+
+    if systemctl restart ssh 2>/dev/null; then
+        :
+    elif systemctl restart sshd 2>/dev/null; then
+        :
+    else
+        fail_install "SSH restart failed."
+    fi
 }
 
 # ============================================================
@@ -144,27 +179,51 @@ install_require() {
 
     log "Installing dependencies..."
 
-    apt-get update ||
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+    systemctl stop firewalld 2>/dev/null || true
+    systemctl disable firewalld 2>/dev/null || true
+
+    systemctl stop nftables 2>/dev/null || true
+    systemctl disable nftables 2>/dev/null || true
+
+    systemctl stop ufw 2>/dev/null || true
+    systemctl disable ufw 2>/dev/null || true
+
+    apt update ||
         fail_install "apt update failed."
 
-    apt-get install -y \
+    apt install -y \
+        lsof \
+        tar \
+        systemd \
+        dbus \
+        git \
+        gnupg2 \
+        ca-certificates \
+        lsb-release \
+        debian-archive-keyring \
+        socat \
         curl \
         wget \
         cron \
         python3-minimal \
         libpython3-stdlib \
         iptables \
-        iptables-persistent \
+        sudo \
         openvpn \
         netcat-openbsd \
         httpie \
         php \
+        php-mysql \
+        neofetch \
         vnstat \
         screen \
         squid \
         stunnel4 \
         dropbear \
         gnutls-bin \
+        build-essential \
         dos2unix \
         nano \
         unzip \
@@ -175,7 +234,6 @@ install_require() {
         mlocate \
         dh-make \
         libaudit-dev \
-        build-essential \
         fail2ban \
         libssl-dev \
         zlib1g-dev \
@@ -185,83 +243,84 @@ install_require() {
         libreadline-dev \
         libffi-dev \
         openssl \
-        ca-certificates \
-        sudo \
-        tar \
-        systemd \
-        dbus \
-        socat \
-        git \
-        lsb-release \
-        debian-archive-keyring \
-        grub2-common \
-        linux-image-amd64 \
+        iptables-persistent \
         || fail_install "Required packages could not be installed."
-
-    systemctl enable cron >/dev/null 2>&1 || true
-    systemctl restart cron >/dev/null 2>&1 || true
 
     mkdir -p /usr/local/bin
     mkdir -p /usr/local/var
     mkdir -p /usr/local/var/run
     mkdir -p /root/.web
 
-    chmod 755 /root/.web
+    chmod 700 /root/.web
 
-    # --------------------------------------------------------
-    # Python 2.7
-    # --------------------------------------------------------
+    systemctl enable cron >/dev/null 2>&1 || true
+    systemctl restart cron >/dev/null 2>&1 || true
 
-    if [ ! -x /usr/local/bin/python2.7 ]; then
+    log "Dependencies installed."
+}
 
-        cd /usr/src ||
-            fail_install "Cannot enter /usr/src."
+# ============================================================
+# PYTHON 2.7
+# ============================================================
 
-        wget \
-            --no-check-certificate \
-            -O Python-2.7.18.tgz \
-            https://mediatekvpn.uk/sabrinavpn/Python-2.7.18.tgz \
-            || fail_install "Python 2.7 download failed."
+install_python27() {
 
-        rm -rf Python-2.7.18
+    log "Installing Python 2.7..."
 
-        tar xzf Python-2.7.18.tgz ||
-            fail_install "Python extraction failed."
-
-        cd Python-2.7.18 ||
-            fail_install "Python source directory missing."
-
-        ./configure --enable-optimizations ||
-            fail_install "Python configure failed."
-
-        make altinstall ||
-            fail_install "Python compilation failed."
-
+    if [ -x /usr/local/bin/python2.7 ]; then
+        log "Python 2.7 already installed."
+        return 0
     fi
+
+    cd /usr/src ||
+        fail_install "Cannot enter /usr/src."
+
+    rm -f Python-2.7.18.tgz
+    rm -rf Python-2.7.18
+
+    wget \
+        --no-check-certificate \
+        -q \
+        -O Python-2.7.18.tgz \
+        https://mediatekvpn.uk/sabrinavpn/Python-2.7.18.tgz ||
+        fail_install "Python 2.7 download failed."
+
+    tar xzf Python-2.7.18.tgz ||
+        fail_install "Python 2.7 extraction failed."
+
+    cd Python-2.7.18 ||
+        fail_install "Python source directory missing."
+
+    ./configure --enable-optimizations ||
+        fail_install "Python configure failed."
+
+    make altinstall ||
+        fail_install "Python compilation failed."
 
     ln -sf /usr/local/bin/python2.7 /usr/local/bin/python
 
-    log "Python installation complete."
+    log "Python 2.7 installed."
+}
 
-    # --------------------------------------------------------
-    # Disable conflicting firewalls
-    # --------------------------------------------------------
+# ============================================================
+# DATABASE CONNECTION TEST
+# ============================================================
 
-    systemctl stop ufw 2>/dev/null || true
-    systemctl disable ufw 2>/dev/null || true
+test_database() {
 
-    systemctl stop nftables 2>/dev/null || true
-    systemctl disable nftables 2>/dev/null || true
+    log "Testing database connection..."
 
-    # --------------------------------------------------------
-    # BBR module
-    # --------------------------------------------------------
+    mysql \
+        -h "$HOST" \
+        -u "$USER" \
+        -p"$PASS" \
+        -D "$DBNAME" \
+        -e "SELECT 1;" >/dev/null 2>&1 ||
 
-    modprobe tcp_bbr 2>/dev/null || true
+        fail_install \
+        "Database connection failed. Check host/user/password/database."
 
-    cat >/etc/modules-load.d/tcp-bbr.conf <<'EOF'
-tcp_bbr
-EOF
+    log "Database connection OK."
 }
 
 # ============================================================
@@ -270,7 +329,7 @@ EOF
 
 generate_openvpn_certificates() {
 
-    log "Generating fresh OpenVPN certificates..."
+    log "Generating OpenVPN certificates..."
 
     mkdir -p /etc/openvpn/easy-rsa/keys
 
@@ -336,15 +395,15 @@ generate_openvpn_certificates() {
     openssl x509 \
         -in /etc/openvpn/easy-rsa/keys/server.crt \
         -noout ||
-        fail_install "Invalid server certificate."
+        fail_install "Server certificate validation failed."
 
     openssl rsa \
         -in /etc/openvpn/easy-rsa/keys/server.key \
         -check \
         -noout ||
-        fail_install "Invalid server key."
+        fail_install "Server private key validation failed."
 
-    log "OpenVPN certificates generated."
+    log "OpenVPN certificates generated successfully."
 }
 
 # ============================================================
@@ -355,13 +414,11 @@ install_openvpn() {
 
     log "Installing OpenVPN..."
 
-    mkdir -p \
-        /etc/openvpn/easy-rsa/keys \
-        /etc/openvpn/login \
-        /etc/openvpn/server \
-        /var/www/html/stat
+    mkdir -p /etc/openvpn/login
+    mkdir -p /etc/openvpn/server
+    mkdir -p /var/www/html/stat
 
-    cat >/etc/openvpn/server.conf <<EOF
+    cat > /etc/openvpn/server.conf <<EOF
 port $PORT_UDP
 proto udp
 dev tun
@@ -374,13 +431,11 @@ cert /etc/openvpn/easy-rsa/keys/server.crt
 key /etc/openvpn/easy-rsa/keys/server.key
 
 dh none
-
 tls-server
 tls-version-min 1.2
 
 auth SHA256
 cipher AES-128-GCM
-
 data-ciphers AES-128-GCM:AES-256-GCM:AES-128-CBC
 data-ciphers-fallback AES-128-CBC
 
@@ -399,7 +454,6 @@ verify-client-cert none
 username-as-common-name
 
 script-security 3
-
 auth-user-pass-verify "/etc/openvpn/login/auth_vpn" via-env
 
 push "redirect-gateway def1 bypass-dhcp"
@@ -415,7 +469,7 @@ client-connect /etc/openvpn/login/connect.sh
 client-disconnect /etc/openvpn/login/disconnect.sh
 EOF
 
-    cat >/etc/openvpn/server2.conf <<EOF
+    cat > /etc/openvpn/server2.conf <<EOF
 port $PORT_TCP
 proto tcp
 dev tun
@@ -428,7 +482,6 @@ cert /etc/openvpn/easy-rsa/keys/server.crt
 key /etc/openvpn/easy-rsa/keys/server.key
 
 dh none
-
 tls-server
 tls-version-min 1.2
 
@@ -448,13 +501,12 @@ group nogroup
 
 client-to-client
 duplicate-cn
-
 username-as-common-name
-verify-client-cert none
 
 script-security 3
-
 auth-user-pass-verify "/etc/openvpn/login/auth_vpn" via-env
+
+verify-client-cert none
 
 push "redirect-gateway def1 bypass-dhcp"
 push "dhcp-option DNS 8.8.8.8"
@@ -469,23 +521,19 @@ client-connect /etc/openvpn/login/connect.sh
 client-disconnect /etc/openvpn/login/disconnect.sh
 EOF
 
-    # --------------------------------------------------------
-    # Database configuration
-    # --------------------------------------------------------
-
-    cat >/etc/openvpn/login/config.sh <<EOF
+    cat > /etc/openvpn/login/config.sh <<EOF
 #!/bin/bash
 
-HOST='$DB_HOST'
-USER='$DB_USER'
-PASS='$DB_PASS'
-DB='$DB_NAME'
+HOST='$HOST'
+USER='$USER'
+PASS='$PASS'
+DB='$DBNAME'
 EOF
 
     chmod 700 /etc/openvpn/login/config.sh
 
     # --------------------------------------------------------
-    # Authentication scripts
+    # Authentication
     # --------------------------------------------------------
 
     wget -q \
@@ -498,14 +546,14 @@ EOF
         https://mediatekvpn.uk/sabrinavpn/authentication/connect.sh ||
         fail_install "connect.sh download failed."
 
+    sed -i \
+        "s|SERVER_IP|$server_ip|g" \
+        /etc/openvpn/login/connect.sh
+
     wget -q \
         -O /etc/openvpn/login/disconnect.sh \
         https://mediatekvpn.uk/sabrinavpn/authentication/disconnect.sh ||
         fail_install "disconnect.sh download failed."
-
-    sed -i \
-        "s|SERVER_IP|$server_ip|g" \
-        /etc/openvpn/login/connect.sh
 
     sed -i \
         "s|SERVER_IP|$server_ip|g" \
@@ -524,25 +572,21 @@ EOF
 
     generate_openvpn_certificates
 
-    # --------------------------------------------------------
-    # Validate configuration
-    # --------------------------------------------------------
-
-    log "Testing OpenVPN UDP configuration..."
+    log "Validating OpenVPN UDP configuration..."
 
     openvpn \
         --config /etc/openvpn/server.conf \
         --test-parse ||
-        fail_install "OpenVPN UDP configuration failed."
+        fail_install "OpenVPN UDP configuration invalid."
 
-    log "Testing OpenVPN TCP configuration..."
+    log "Validating OpenVPN TCP configuration..."
 
     openvpn \
         --config /etc/openvpn/server2.conf \
         --test-parse ||
-        fail_install "OpenVPN TCP configuration failed."
+        fail_install "OpenVPN TCP configuration invalid."
 
-    log "OpenVPN configuration is valid."
+    log "OpenVPN configuration valid."
 }
 
 # ============================================================
@@ -562,12 +606,15 @@ install_hysteria() {
 
     chmod +x /root/install_server.sh
 
-    /root/install_server.sh --version v1.3.5 ||
+    cd /root ||
+        fail_install "Cannot enter /root."
+
+    ./install_server.sh --version v1.3.5 ||
         fail_install "Hysteria installation failed."
 
     mkdir -p /etc/hysteria
 
-    cat >/etc/hysteria/config.json <<EOF
+    cat > /etc/hysteria/config.json <<EOF
 {
   "listen": ":5666",
   "cert": "/etc/openvpn/easy-rsa/keys/server.crt",
@@ -576,16 +623,87 @@ install_hysteria() {
   "down_mbps": 100,
   "disable_udp": false,
   "obfs": "$OBFS",
+  "auth": {
+    "mode": "external",
+    "config": {
+      "cmd": "./.auth.sh"
+    }
+  },
   "prometheus_listen": ":5665",
   "recv_window_conn": 107374182400,
   "recv_window_client": 13421772800
 }
 EOF
 
-    chmod 600 /etc/hysteria/config.json
+    cat > /etc/hysteria/.auth.sh <<'EOF'
+#!/bin/bash
 
-    sysctl -w net.core.rmem_max=16777216 || true
-    sysctl -w net.core.wmem_max=16777216 || true
+. /etc/openvpn/login/config.sh
+
+if [ "$#" -ne 4 ]; then
+    echo "invalid number of arguments"
+    exit 1
+fi
+
+ADDR="$1"
+AUTH="$2"
+SEND="$3"
+RECV="$4"
+
+USERNAME="${AUTH%%:*}"
+PASSWORD="${AUTH#*:}"
+
+if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+    echo "authentication failed."
+    exit 1
+fi
+
+SAFE_USERNAME="$(printf '%s' "$USERNAME" |
+    sed "s/'/''/g")"
+
+SAFE_PASSWORD="$(printf '%s' "$PASSWORD" |
+    sed "s/'/''/g")"
+
+QUERY="
+SELECT user_name
+FROM users
+WHERE user_name='$SAFE_USERNAME'
+AND auth_vpn=md5('$SAFE_PASSWORD')
+AND status='live'
+AND is_freeze=0
+AND is_ban=0
+AND (
+    duration > 0
+    OR vip_duration > 0
+    OR private_duration > 0
+)
+LIMIT 1
+"
+
+USER_NAME="$(
+    mysql \
+        -u "$USER" \
+        -p"$PASS" \
+        -D "$DB" \
+        -h "$HOST" \
+        -sN \
+        -e "$QUERY" 2>/dev/null
+)"
+
+if [ "$USER_NAME" = "$USERNAME" ]; then
+    echo "authentication ok."
+    exit 0
+fi
+
+echo "authentication failed."
+exit 1
+EOF
+
+    chmod 755 /etc/hysteria/.auth.sh
+    chmod 644 /etc/hysteria/config.json
+
+    sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1 || true
+    sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1 || true
 
     wget -q \
         -O /usr/bin/badvpn-udpgw \
@@ -596,12 +714,12 @@ EOF
 }
 
 # ============================================================
-# SQUID + SOCKS
+# SQUID + WS
 # ============================================================
 
 install_squid() {
 
-    log "Installing Squid and SOCKS..."
+    log "Installing Squid and WS..."
 
     wget \
         --no-check-certificate \
@@ -612,14 +730,17 @@ install_squid() {
 
     chmod +x /etc/init.d/squid
 
-    update-rc.d squid defaults 2>/dev/null || true
+    update-rc.d squid defaults >/dev/null 2>&1 || true
 
-    mkdir -p /etc/squid
     mkdir -p /var/log/squid
 
-    rm -f /etc/squid/squid.conf
+    chown -R proxy:proxy /var/log/squid 2>/dev/null || true
 
-    cat >/etc/squid/squid.conf <<EOF
+    squid -z >/dev/null 2>&1 || true
+
+    mkdir -p /etc/squid
+
+    cat > /etc/squid/squid.conf <<EOF
 acl Firenet dst $server_ip
 
 http_port 8080
@@ -645,14 +766,8 @@ visible_hostname Dexter-Proxy
 error_directory /usr/share/squid/errors/English
 EOF
 
-    squid -z 2>/dev/null || true
-
-    systemctl enable squid 2>/dev/null || true
-    systemctl restart squid 2>/dev/null || true
-
-    # --------------------------------------------------------
-    # Python WS proxy
-    # --------------------------------------------------------
+    systemctl enable squid >/dev/null 2>&1 || true
+    systemctl restart squid >/dev/null 2>&1 || true
 
     wget -q \
         -O /etc/socks.py \
@@ -660,14 +775,15 @@ EOF
         fail_install "socks.py download failed."
 
     dos2unix /etc/socks.py 2>/dev/null || true
-    chmod 755 /etc/socks.py
+    chmod +x /etc/socks.py
 
-    cat >/etc/systemd/system/socks.service <<'EOF'
+    cat > /etc/systemd/system/socks.service <<'EOF'
 [Unit]
 Description=Python WS Proxy
 After=network.target
 
 [Service]
+Type=simple
 ExecStart=/usr/bin/python3 /etc/socks.py
 Restart=always
 RestartSec=3
@@ -681,26 +797,52 @@ EOF
     systemctl enable socks
     systemctl restart socks
 
-    # --------------------------------------------------------
-    # Additional proxy scripts
-    # --------------------------------------------------------
-
     wget -q \
         -O /etc/socks-ssh.py \
-        https://mediatekvpn.uk/sabrinavpn/socks-ssh.py || true
+        https://mediatekvpn.uk/sabrinavpn/socks-ssh.py ||
+        true
 
     wget -q \
         -O /etc/socks-ws-ssh.py \
-        https://mediatekvpn.uk/sabrinavpn/socks-ws-ssh.py || true
+        https://mediatekvpn.uk/sabrinavpn/socks-ws-ssh.py ||
+        true
 
     wget -q \
         -O /etc/socks-ws-ssl.py \
-        https://mediatekvpn.uk/sabrinavpn/socks-ws-ssl.py || true
+        https://mediatekvpn.uk/sabrinavpn/socks-ws-ssl.py ||
+        true
 
-    chmod 755 \
+    chmod +x \
         /etc/socks-ssh.py \
         /etc/socks-ws-ssh.py \
         /etc/socks-ws-ssl.py \
+        2>/dev/null || true
+
+    wget -q \
+        -O /etc/.monitor \
+        https://mediatekvpn.uk/sabrinavpn/monitor ||
+        true
+
+    wget -q \
+        -O /etc/.ws \
+        https://mediatekvpn.uk/sabrinavpn/ws ||
+        true
+
+    wget -q \
+        -O /etc/.hysteria \
+        https://mediatekvpn.uk/sabrinavpn/hysteria ||
+        true
+
+    chmod +x \
+        /etc/.monitor \
+        /etc/.ws \
+        /etc/.hysteria \
+        2>/dev/null || true
+
+    dos2unix \
+        /etc/.monitor \
+        /etc/.ws \
+        /etc/.hysteria \
         2>/dev/null || true
 }
 
@@ -708,51 +850,73 @@ EOF
 # BBR
 # ============================================================
 
-install_bbr() {
+installBBR() {
 
     log "Enabling BBR..."
 
     sed -i \
-        '/net.core.default_qdisc/d' \
+        '/^net.core.default_qdisc=/d' \
         /etc/sysctl.conf
 
     sed -i \
-        '/net.ipv4.tcp_congestion_control/d' \
+        '/^net.ipv4.tcp_congestion_control=/d' \
         /etc/sysctl.conf
 
-    echo "net.core.default_qdisc=fq" \
-        >>/etc/sysctl.conf
-
-    echo "net.ipv4.tcp_congestion_control=bbr" \
-        >>/etc/sysctl.conf
-
-    modprobe tcp_bbr 2>/dev/null || true
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
 
     sysctl -p >/dev/null 2>&1 || true
 
-    log "TCP congestion control:"
-    sysctl net.ipv4.tcp_congestion_control || true
+    mkdir -p /etc/modules-load.d
+
+    if ! grep -q '^tcp_bbr$' \
+        /etc/modules-load.d/modules.conf 2>/dev/null; then
+
+        echo "tcp_bbr" \
+            >> /etc/modules-load.d/modules.conf
+    fi
+
+    modprobe tcp_bbr 2>/dev/null || true
 }
 
 # ============================================================
 # FIREWALL / NAT
 # ============================================================
 
-install_firewall() {
+install_firewall_kvm() {
 
     log "Configuring firewall and NAT..."
 
-    cat >/etc/sysctl.d/99-vpn.conf <<EOF
+    sed -i \
+        '/^net.ipv4.ip_forward=/d' \
+        /etc/sysctl.conf
+
+    sed -i \
+        '/^net.ipv4.conf.all.rp_filter=/d' \
+        /etc/sysctl.conf
+
+    sed -i \
+        "/^net.ipv4.conf.${server_interface}.rp_filter=/d" \
+        /etc/sysctl.conf
+
+    cat >> /etc/sysctl.conf <<EOF
 net.ipv4.ip_forward=1
 net.ipv4.conf.all.rp_filter=0
 net.ipv4.conf.$server_interface.rp_filter=0
 EOF
 
-    sysctl --system >/dev/null 2>&1 || true
+    sysctl -p >/dev/null 2>&1 || true
 
-    # Flush existing IPv4 filter/NAT rules.
     iptables -F
     iptables -t nat -F
+
+    # Hysteria UDP forwarding
+    iptables -t nat -A PREROUTING \
+        -i "$server_interface" \
+        -p udp \
+        --dport 10000:50000 \
+        -j DNAT \
+        --to-destination :5666
 
     # OpenVPN NAT
     iptables -t nat -A POSTROUTING \
@@ -765,83 +929,67 @@ EOF
         -o "$server_interface" \
         -j MASQUERADE
 
-    # Hysteria UDP port range
-    iptables -t nat -A PREROUTING \
-        -i "$server_interface" \
-        -p udp \
-        --dport 10000:50000 \
-        -j DNAT \
-        --to-destination ":$HYSTERIA_PORT"
-
-    # SlowDNS port
+    # SlowDNS
     iptables -I INPUT \
         -p udp \
         --dport 5300 \
         -j ACCEPT
 
-    # Common VPN ports
-    iptables -I INPUT \
-        -p tcp \
-        --dport "$PORT_TCP" \
-        -j ACCEPT
-
-    iptables -I INPUT \
+    iptables -t nat -I PREROUTING \
+        -i "$server_interface" \
         -p udp \
-        --dport "$PORT_UDP" \
-        -j ACCEPT
+        --dport 53 \
+        -j REDIRECT \
+        --to-ports 5300
 
-    iptables -I INPUT \
-        -p tcp \
-        --dport "$PORT_SSL" \
-        -j ACCEPT
-
-    iptables -I INPUT \
-        -p tcp \
-        --dport 22 \
-        -j ACCEPT
-
-    iptables -I INPUT \
-        -p tcp \
-        --dport 8080 \
-        -j ACCEPT
-
-    iptables -I INPUT \
-        -p tcp \
-        --dport 5666 \
-        -j ACCEPT
-
-    iptables -I INPUT \
+    # Rate limiting
+    iptables -A INPUT \
         -p udp \
-        --dport 5666 \
-        -j ACCEPT
+        --dport 20100:20900 \
+        -m state \
+        --state NEW \
+        -m recent \
+        --update \
+        --seconds 30 \
+        --hitcount 10 \
+        --name DEFAULT \
+        --mask 255.255.255.255 \
+        --rsource \
+        -j DROP
 
-    # Save rules
-    iptables-save >/etc/iptables_rules.v4
+    iptables -A INPUT \
+        -p udp \
+        --dport 20100:20900 \
+        -m state \
+        --state NEW \
+        -m recent \
+        --set \
+        --name DEFAULT \
+        --mask 255.255.255.255 \
+        --rsource
 
-    ip6tables-save >/etc/iptables_rules.v6
+    iptables-save > /etc/iptables_rules.v4
+    ip6tables-save > /etc/iptables_rules.v6
 
-    mkdir -p /etc/iptables
+    chmod 600 \
+        /etc/iptables_rules.v4 \
+        /etc/iptables_rules.v6
 
-    cp /etc/iptables_rules.v4 \
-        /etc/iptables/rules.v4
-
-    cp /etc/iptables_rules.v6 \
-        /etc/iptables/rules.v6
-
-    # File limits
     sed -i \
-        '/^\*\ *soft\ *nofile\ /d' \
+        '/^\*\ *soft\ *nofile\ *[0-9]/d' \
         /etc/security/limits.conf
 
     sed -i \
-        '/^\*\ *hard\ *nofile\ /d' \
+        '/^\*\ *hard\ *nofile\ *[0-9]/d' \
         /etc/security/limits.conf
 
     echo '* soft nofile 65536' \
-        >>/etc/security/limits.conf
+        >> /etc/security/limits.conf
 
     echo '* hard nofile 65536' \
-        >>/etc/security/limits.conf
+        >> /etc/security/limits.conf
+
+    log "Firewall configured."
 }
 
 # ============================================================
@@ -850,37 +998,33 @@ EOF
 
 install_stunnel() {
 
-    log "Configuring stunnel..."
+    log "Installing Stunnel..."
 
     mkdir -p /etc/stunnel
 
-    rm -f \
-        /etc/stunnel/stunnel.key \
-        /etc/stunnel/stunnel.crt \
-        /etc/stunnel/stunnel.pem
+    cd /etc/stunnel ||
+        fail_install "Cannot enter /etc/stunnel."
+
+    rm -f stunnel.key stunnel.crt stunnel.pem
 
     openssl req \
         -x509 \
         -newkey rsa:2048 \
         -nodes \
-        -keyout /etc/stunnel/stunnel.key \
-        -out /etc/stunnel/stunnel.crt \
+        -keyout stunnel.key \
+        -out stunnel.crt \
         -days 3650 \
         -subj "/CN=$server_ip" ||
         fail_install "Stunnel certificate generation failed."
 
-    cat \
-        /etc/stunnel/stunnel.key \
-        /etc/stunnel/stunnel.crt \
-        >/etc/stunnel/stunnel.pem
+    cat stunnel.key stunnel.crt > stunnel.pem
 
-    chmod 600 /etc/stunnel/stunnel.key
-    chmod 600 /etc/stunnel/stunnel.pem
-    chmod 644 /etc/stunnel/stunnel.crt
+    chmod 600 stunnel.key stunnel.pem
+    chmod 644 stunnel.crt
 
-    cat >/etc/stunnel/stunnel.conf <<EOF
+    cat > /etc/stunnel/stunnel.conf <<EOF
 pid = /var/run/stunnel4.pid
-debug = 3
+debug = 0
 output = /var/log/stunnel4.log
 
 cert = /etc/stunnel/stunnel.pem
@@ -888,9 +1032,17 @@ cert = /etc/stunnel/stunnel.pem
 [openvpn-tcp]
 connect = 127.0.0.1:$PORT_TCP
 accept = 0.0.0.0:$PORT_SSL
+
+[ssh]
+connect = 127.0.0.1:22
+accept = 0.0.0.0:445
+
+[dropbear]
+connect = 127.0.0.1:442
+accept = 0.0.0.0:446
 EOF
 
-    cat >/etc/default/stunnel4 <<'EOF'
+    cat > /etc/default/stunnel4 <<'EOF'
 ENABLED=1
 FILES="/etc/stunnel/*.conf"
 OPTIONS=""
@@ -898,25 +1050,388 @@ PPP_RESTART=0
 RLIMITS=""
 EOF
 
+    cat > /etc/default/dropbear <<'EOF'
+NO_START=0
+DROPBEAR_PORT=442
+DROPBEAR_EXTRA_ARGS=
+DROPBEAR_BANNER="/etc/banner"
+DROPBEAR_RECEIVE_WINDOW=65536
+EOF
+
+    chmod 644 \
+        /etc/default/stunnel4 \
+        /etc/default/dropbear
+
+    wget -q \
+        -O /etc/banner \
+        https://raw.githubusercontent.com/EskalarteDexter/Autoscript/main/SshBanner \
+        || true
+
+    chmod 755 /etc/banner 2>/dev/null || true
+
     systemctl daemon-reload
-    systemctl enable stunnel4
+
+    systemctl enable stunnel4 >/dev/null 2>&1 || true
+    systemctl enable dropbear >/dev/null 2>&1 || true
+
+    systemctl restart dropbear >/dev/null 2>&1 || true
 
     systemctl restart stunnel4 ||
         fail_install "stunnel4 failed to start."
 }
 
 # ============================================================
-# DOWNLOAD MONITOR / WS HELPERS
+# API ACCOUNT SYNCHRONIZATION
 # ============================================================
 
-install_helpers() {
+install_api_sync() {
 
-    log "Installing helper scripts..."
+    log "Configuring API synchronization..."
+
+    cat > /etc/authentication.sh <<EOF
+#!/bin/bash
+
+SHELL=/bin/bash
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin
+
+API_LINK="$API_LINK"
+API_KEY="$API_KEY"
+
+download_api() {
+
+    local name="\$1"
+    local endpoint="\$2"
 
     wget -q \
-        -O /etc/.monitor \
-        https://mediatekvpn.uk/sabrinavpn/monitor || true
+        -O "/etc/\${name}.sh" \
+        "\${API_LINK}/\${endpoint}?key=\${API_KEY}"
 
-    wget -q \
-        -O /etc/.ws \
-        https://mediatekvpn.uk/sabrinavpn/ws ||
+    if [ ! -s "/etc/\${name}.sh" ]; then
+        exit 1
+    fi
+
+    chmod 700 "/etc/\${name}.sh"
+}
+
+download_api active active.php
+download_api inactive inactive.php
+download_api deleted deleted.php
+
+bash /etc/active.sh
+bash /etc/inactive.sh
+bash /etc/deleted.sh
+EOF
+
+    chmod 700 /etc/authentication.sh
+
+    cat > /etc/cron.d/account <<'EOF'
+* * * * * root /bin/bash /etc/authentication.sh >/dev/null 2>&1
+EOF
+
+    chmod 644 /etc/cron.d/account
+
+    log "API synchronization configured."
+}
+
+# ============================================================
+# FINAL SERVICES
+# ============================================================
+
+install_rclocal() {
+
+    log "Configuring final services..."
+
+    if [ -f /etc/apache2/ports.conf ]; then
+
+        sed -i \
+            's/^Listen 80$/Listen 81/' \
+            /etc/apache2/ports.conf
+
+        systemctl restart apache2 >/dev/null 2>&1 || true
+    fi
+
+    cat > /etc/rc.local <<'EOF'
+#!/bin/sh -e
+
+iptables-restore \
+    < /etc/iptables_rules.v4 \
+    2>/dev/null || true
+
+ip6tables-restore \
+    < /etc/iptables_rules.v6 \
+    2>/dev/null || true
+
+sysctl -p \
+    >/dev/null 2>&1 || true
+
+systemctl restart stunnel4 \
+    >/dev/null 2>&1 || true
+
+systemctl restart openvpn@server.service \
+    >/dev/null 2>&1 || true
+
+systemctl restart openvpn@server2.service \
+    >/dev/null 2>&1 || true
+
+if ! pgrep -f "badvpn-udpgw.*7300" >/dev/null 2>&1; then
+
+    screen -dmS udpvpn \
+        /usr/bin/badvpn-udpgw \
+        --listen-addr 127.0.0.1:7300 \
+        --max-clients 10000 \
+        --max-connections-for-client 10 \
+        --client-socket-sndbuf 10000
+
+fi
+
+if [ -x /etc/.monitor ]; then
+    bash /etc/.monitor openvpn \
+        >/dev/null 2>&1 || true
+fi
+
+exit 0
+EOF
+
+    chmod +x /etc/rc.local
+
+    cat > /etc/systemd/system/dexter.service <<'EOF'
+[Unit]
+Description=Dexter Server Service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /etc/rc.local
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+
+    systemctl enable openvpn@server.service ||
+        fail_install "Unable to enable OpenVPN UDP."
+
+    systemctl enable openvpn@server2.service ||
+        fail_install "Unable to enable OpenVPN TCP."
+
+    systemctl start openvpn@server.service ||
+        fail_install "OpenVPN UDP failed to start."
+
+    systemctl start openvpn@server2.service ||
+        fail_install "OpenVPN TCP failed to start."
+
+    if systemctl list-unit-files |
+        grep -q '^hysteria-server.service'; then
+
+        systemctl enable hysteria-server.service \
+            >/dev/null 2>&1 || true
+
+        systemctl restart hysteria-server.service \
+            >/dev/null 2>&1 || true
+    fi
+
+    systemctl enable dexter.service ||
+        fail_install "Unable to enable dexter service."
+
+    systemctl start dexter.service ||
+        fail_install "Dexter service failed."
+
+    echo "Made with love by: MediatekVpn Developer..." \
+        > /root/.web/index.php
+
+    cat > /root/.ports <<EOF
+tcp_port=$PORT_TCP
+udp_port=$PORT_UDP
+socket_port=80
+squid_port=8080
+hysteria_port=5666
+ssh_port=22
+dropbear_port=442
+tcp_ssl_port=$PORT_SSL
+udp_ssl_port=444
+EOF
+
+    chmod 600 /root/.ports
+}
+
+# ============================================================
+# SERVICE CHECK
+# ============================================================
+
+check_service() {
+
+    local service="$1"
+
+    log "Checking $service..."
+
+    if systemctl is-active --quiet "$service"; then
+        log "$service : ACTIVE"
+        return 0
+    fi
+
+    log "$service : NOT ACTIVE"
+
+    systemctl status \
+        "$service" \
+        --no-pager \
+        --full || true
+
+    journalctl \
+        -u "$service" \
+        --no-pager \
+        -n 50 || true
+
+    return 1
+}
+
+# ============================================================
+# VERIFY
+# ============================================================
+
+verify_installation() {
+
+    log "=========================================="
+    log "VERIFYING INSTALLATION"
+    log "=========================================="
+
+    check_service openvpn@server.service ||
+        return 1
+
+    check_service openvpn@server2.service ||
+        return 1
+
+    check_service stunnel4.service ||
+        return 1
+
+    check_service socks.service ||
+        return 1
+
+    if systemctl list-unit-files |
+        grep -q '^hysteria-server.service'; then
+
+        check_service hysteria-server.service ||
+            return 1
+    fi
+
+    log "=========================================="
+    log "ALL CRITICAL SERVICES ARE ACTIVE"
+    log "=========================================="
+
+    return 0
+}
+
+# ============================================================
+# CRON
+# ============================================================
+
+configure_cron() {
+
+    log "Configuring maintenance cron..."
+
+    crontab -l 2>/dev/null |
+        grep -v \
+        -E '/etc/\.ws|/etc/\.hysteria|/etc/\.monitor|stunnel4 restart' \
+        > /tmp/panel_cron 2>/dev/null || true
+
+    cat >> /tmp/panel_cron <<'EOF'
+* * * * * pgrep -x stunnel4 >/dev/null || /etc/init.d/stunnel4 restart >/dev/null 2>&1
+* * * * * [ -x /etc/.ws ] && /bin/bash /etc/.ws >/dev/null 2>&1
+* * * * * [ -x /etc/.hysteria ] && /bin/bash /etc/.hysteria >/dev/null 2>&1
+* * * * * [ -x /etc/.monitor ] && /bin/bash /etc/.monitor openvpn >/dev/null 2>&1
+EOF
+
+    crontab /tmp/panel_cron
+    rm -f /tmp/panel_cron
+
+    systemctl restart cron
+}
+
+# ============================================================
+# FINAL
+# ============================================================
+
+start_service() {
+
+    configure_cron
+
+    echo
+    echo "=========================================="
+    echo "        Debian OpenWS READY"
+    echo "=========================================="
+    echo
+    echo "Server IP        : $server_ip"
+    echo "OpenVPN TCP      : $PORT_TCP"
+    echo "OpenVPN UDP      : $PORT_UDP"
+    echo "SSL Port         : $PORT_SSL"
+    echo "Squid            : 8080"
+    echo "Hysteria         : 5666"
+    echo "SSH              : 22"
+    echo "Dropbear         : 442"
+    echo "API              : $API_LINK"
+    echo
+    echo "=========================================="
+
+    if ! verify_installation; then
+
+        echo
+        echo "=========================================="
+        echo "INSTALLATION FAILED"
+        echo "SERVER WILL NOT REBOOT."
+        echo
+        echo "Installation log:"
+        echo "$LOG_FILE"
+        echo "=========================================="
+
+        exit 1
+    fi
+
+    history -c 2>/dev/null || true
+
+    rm -f \
+        /usr/local/etc/.system \
+        2>/dev/null || true
+
+    echo
+    echo "All critical services are ACTIVE."
+    echo
+    echo "Server will reboot after 20 seconds."
+    echo
+
+    sleep 20
+
+    reboot
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+
+detect_server
+
+install_sudo
+
+install_require
+
+install_python27
+
+test_database
+
+install_hysteria
+
+installBBR
+
+install_squid
+
+install_openvpn
+
+install_firewall_kvm
+
+install_stunnel
+
+install_api_sync
+
+install_rclocal
+
+start_service
